@@ -363,6 +363,15 @@ async def list_global_notifications(
             for notif in result.data:
                 metadata = notif.get('metadata', {})
                 
+                # Handle case where metadata might be a string (Supabase JSONB can return as string)
+                if isinstance(metadata, str):
+                    import json
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(f"Failed to parse metadata as JSON in list: {metadata}")
+                        metadata = {}
+                
                 if metadata.get('is_batch_tracker'):
                     # This is a tracking notification
                     batch_id = metadata.get('batch_id')
@@ -450,40 +459,172 @@ async def get_global_notification_batch(
         await db.initialize()
         client = await db.client
         
-        # Get all notifications in this batch
-        # Query by metadata JSONB field containing the batch_id
-        result = await client.table('notifications').select('*').eq('is_global', True).execute()
+        logger.debug(f"Searching for batch_id: {batch_id}")
         
-        # Filter in Python to find notifications with matching batch_id in metadata
-        filtered_notifications = []
-        if result.data:
-            for notif in result.data:
-                metadata = notif.get('metadata', {})
-                if isinstance(metadata, dict) and metadata.get('global_batch_id') == batch_id:
-                    filtered_notifications.append(notif)
+        # Query for tracking and user notifications
+        # Since Supabase Python client may not support JSONB operators directly,
+        # we'll fetch all global notifications and filter client-side
+        # But we'll limit to a reasonable number to avoid performance issues
+        tracking_notif = None
+        user_notifications = []
         
-        result.data = filtered_notifications
+        # Try using JSONB filter first (PostgREST syntax)
+        try:
+            # Query for tracking notification
+            tracking_result = await client.table('notifications').select('*').eq('is_global', True).eq('metadata->>batch_id', batch_id).limit(100).execute()
+            
+            if tracking_result.data:
+                for notif in tracking_result.data:
+                    metadata = notif.get('metadata', {})
+                    
+                    # Handle case where metadata might be a string
+                    if isinstance(metadata, str):
+                        import json
+                        try:
+                            metadata = json.loads(metadata)
+                        except (json.JSONDecodeError, TypeError):
+                            logger.warning(f"Failed to parse tracking metadata as JSON")
+                            continue
+                    
+                    if isinstance(metadata, dict) and metadata.get('is_batch_tracker'):
+                        tracking_notif = notif
+                        logger.debug(f"Found tracking notification for batch {batch_id}")
+                        break
+            
+            # Query for user notifications
+            user_result = await client.table('notifications').select('*').eq('is_global', True).eq('metadata->>global_batch_id', batch_id).limit(1000).execute()
+            
+            if user_result.data:
+                user_notifications = list(user_result.data)
+                logger.debug(f"Found {len(user_notifications)} user notifications for batch {batch_id} via JSONB filter")
+        except Exception as e:
+            # Fallback: Fetch all global notifications and filter client-side
+            logger.debug(f"JSONB filter failed, falling back to client-side filtering: {e}")
+            
+            # Fetch in batches to handle large datasets
+            offset = 0
+            limit = 1000
+            all_processed = False
+            
+            while not all_processed:
+                result = await client.table('notifications').select('*').eq('is_global', True).range(offset, offset + limit - 1).execute()
+                
+                if not result.data or len(result.data) == 0:
+                    all_processed = True
+                    break
+                
+                for notif in result.data:
+                    metadata = notif.get('metadata', {})
+                    
+                    # Handle case where metadata might be a string
+                    if isinstance(metadata, str):
+                        import json
+                        try:
+                            metadata = json.loads(metadata)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                    
+                    if isinstance(metadata, dict):
+                        # Check for tracking notification
+                        if metadata.get('batch_id') == batch_id and metadata.get('is_batch_tracker') and not tracking_notif:
+                            tracking_notif = notif
+                            logger.debug(f"Found tracking notification for batch {batch_id}")
+                        
+                        # Check for user notifications
+                        if metadata.get('global_batch_id') == batch_id:
+                            user_notifications.append(notif)
+                
+                # If we got fewer results than limit, we've reached the end
+                if len(result.data) < limit:
+                    all_processed = True
+                else:
+                    offset += limit
+                
+                # Safety: stop after checking a reasonable number of records
+                if offset >= 10000:  # Max 10k records
+                    logger.warning(f"Reached max records limit (10k) while searching for batch {batch_id}")
+                    break
+            
+            logger.debug(f"Found {len(user_notifications)} user notifications for batch {batch_id} via client-side filtering")
         
-        if not result.data:
+        logger.debug(f"Tracking notification found: {tracking_notif is not None}")
+        logger.debug(f"User notifications found: {len(user_notifications)}")
+        
+        # If neither tracking nor user notifications found, batch doesn't exist
+        if not tracking_notif and not user_notifications:
+            logger.warning(f"Batch {batch_id} not found - no tracking or user notifications")
             raise HTTPException(status_code=404, detail="Global notification batch not found")
         
-        # Aggregate stats
-        first_notif = result.data[0]
-        total_count = len(result.data)
-        emails_sent = sum(1 for n in result.data if n.get('email_sent'))
-        pushes_sent = sum(1 for n in result.data if n.get('push_sent'))
+        # Use tracking notification for batch metadata (if available), otherwise use first user notification
+        if tracking_notif:
+            tracking_metadata = tracking_notif.get('metadata', {})
+            
+            # Handle case where metadata might be a string
+            if isinstance(tracking_metadata, str):
+                import json
+                try:
+                    tracking_metadata = json.loads(tracking_metadata)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"Failed to parse tracking metadata as JSON")
+                    tracking_metadata = {}
+            
+            batch_status = tracking_metadata.get('batch_status', 'pending')
+            total_recipients = tracking_metadata.get('total_recipients', len(user_notifications))
+            emails_sent_tracking = tracking_metadata.get('emails_sent', 0)
+            pushes_sent_tracking = tracking_metadata.get('pushes_sent', 0)
+            started_at = tracking_metadata.get('started_at')
+            completed_at = tracking_metadata.get('completed_at')
+            cancelled_at = tracking_metadata.get('cancelled_at')
+            
+            # Get title from tracking notification (remove [BATCH_TRACKING] prefix)
+            title = tracking_notif.get('title', '').replace('[BATCH_TRACKING] ', '').strip()
+            message = 'Batch tracking record'  # Tracking notifications have a generic message
+            notif_type = tracking_notif.get('type')
+            created_by = tracking_notif.get('created_by')
+            created_at = tracking_notif.get('created_at')
+        else:
+            # Fallback to first user notification if tracking doesn't exist
+            first_notif = user_notifications[0] if user_notifications else None
+            if not first_notif:
+                raise HTTPException(status_code=404, detail="Global notification batch not found")
+            
+            batch_status = 'completed'  # Default status
+            total_recipients = len(user_notifications)
+            emails_sent_tracking = 0
+            pushes_sent_tracking = 0
+            started_at = None
+            completed_at = None
+            cancelled_at = None
+            title = first_notif.get('title')
+            message = first_notif.get('message')
+            notif_type = first_notif.get('type')
+            created_by = first_notif.get('created_by')
+            created_at = first_notif.get('created_at')
+        
+        # Count actual emails/pushes sent from user notifications
+        emails_sent = sum(1 for n in user_notifications if n.get('email_sent'))
+        pushes_sent = sum(1 for n in user_notifications if n.get('push_sent'))
+        
+        # Prefer tracking counts if available (more accurate during sending)
+        if tracking_notif and batch_status in ['sending', 'pending']:
+            emails_sent = emails_sent_tracking
+            pushes_sent = pushes_sent_tracking
         
         return {
             'batch_id': batch_id,
-            'created_by': first_notif.get('created_by'),
-            'title': first_notif.get('title'),
-            'message': first_notif.get('message'),
-            'type': first_notif.get('type'),
-            'created_at': first_notif.get('created_at'),
-            'total_recipients': total_count,
+            'created_by': created_by,
+            'title': title,
+            'message': message,
+            'type': notif_type,
+            'created_at': created_at,
+            'status': batch_status,
+            'total_recipients': total_recipients,
             'emails_sent': emails_sent,
             'pushes_sent': pushes_sent,
-            'notifications': result.data[:10]  # Return first 10 for preview
+            'started_at': started_at,
+            'completed_at': completed_at,
+            'cancelled_at': cancelled_at,
+            'notifications': user_notifications[:10]  # Return first 10 user notifications for preview
         }
         
     except HTTPException:

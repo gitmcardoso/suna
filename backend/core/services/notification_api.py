@@ -95,7 +95,8 @@ async def get_notifications(
         await db.initialize()
         client = await db.client
         
-        # Build query
+        # Build query - exclude batch tracking notifications from user view
+        # First, get all user notifications with filters applied
         query = client.table('notifications').select('*').eq('user_id', user_id).order('created_at', desc=True)
         
         # Apply filters (prefer is_read parameter)
@@ -108,24 +109,74 @@ async def get_notifications(
         if notification_type:
             query = query.eq('type', notification_type)
         
-        # Get total count
-        count_query = query
-        count_result = await count_query.execute()
-        total = len(count_result.data) if count_result.data else 0
+        # Fetch all matching notifications (we'll filter batch tracking client-side)
+        # Note: We fetch all to filter properly, but for performance we limit to reasonable amount
+        result = await query.limit(1000).execute()
         
-        # Paginate
+        logger.debug(f"Found {len(result.data) if result.data else 0} notifications for user {user_id} before filtering")
+        
+        # Filter out batch tracking notifications (internal tracking records)
+        filtered_notifications = []
+        if result.data:
+            for notif in result.data:
+                metadata = notif.get('metadata', {})
+                
+                # Handle case where metadata might be a string
+                if isinstance(metadata, str):
+                    import json
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                
+                # Skip batch tracking notifications (they have is_batch_tracker: true in metadata)
+                if isinstance(metadata, dict) and metadata.get('is_batch_tracker'):
+                    continue
+                
+                # Also skip notifications with [BATCH_TRACKING] prefix in title (legacy check)
+                if notif.get('title', '').startswith('[BATCH_TRACKING]'):
+                    continue
+                
+                filtered_notifications.append(notif)
+        
+        logger.debug(f"Found {len(filtered_notifications)} notifications for user {user_id} after filtering out batch tracking")
+        
+        # Get total count (after filtering)
+        total = len(filtered_notifications)
+        
+        # Paginate after filtering
         offset = (page - 1) * page_size
-        query = query.range(offset, offset + page_size - 1)
-        
-        result = await query.execute()
+        paginated_notifications = filtered_notifications[offset:offset + page_size]
         
         notifications = []
-        if result.data:
-            notifications = [NotificationResponse(**notif) for notif in result.data]
+        if paginated_notifications:
+            notifications = [NotificationResponse(**notif) for notif in paginated_notifications]
         
-        # Get unread count
-        unread_result = await client.table('notifications').select('id', count='exact').eq('user_id', user_id).eq('is_read', False).execute()
-        unread_count = unread_result.count if hasattr(unread_result, 'count') and unread_result.count is not None else (len(unread_result.data) if unread_result.data else 0)
+        # Get unread count (excluding batch tracking) - re-query with proper filters
+        unread_query = client.table('notifications').select('*').eq('user_id', user_id).eq('is_read', False)
+        if category:
+            unread_query = unread_query.eq('category', category)
+        if notification_type:
+            unread_query = unread_query.eq('type', notification_type)
+        
+        unread_result = await unread_query.limit(1000).execute()
+        unread_filtered = []
+        if unread_result.data:
+            for notif in unread_result.data:
+                metadata = notif.get('metadata', {})
+                if isinstance(metadata, str):
+                    import json
+                    try:
+                        metadata = json.loads(metadata)
+                    except (json.JSONDecodeError, TypeError):
+                        metadata = {}
+                if isinstance(metadata, dict) and metadata.get('is_batch_tracker'):
+                    continue
+                if notif.get('title', '').startswith('[BATCH_TRACKING]'):
+                    continue
+                unread_filtered.append(notif)
+        
+        unread_count = len(unread_filtered)
         
         return NotificationListResponse(
             notifications=notifications,
