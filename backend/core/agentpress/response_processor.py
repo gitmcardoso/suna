@@ -635,7 +635,8 @@ class ResponseProcessor:
                                 args_string = tc_buf['function']['arguments']
                                 
                                 # Validate it's valid JSON (but keep as string)
-                                parsed_args = safe_json_parse(args_string)  # Just for validation
+                                # Use json.loads() directly for consistency with accumulation validation (line 471)
+                                json.loads(args_string)  # Raises JSONDecodeError if invalid
                                 
                                 tool_call_obj = {
                                     "id": tc_buf['id'], 
