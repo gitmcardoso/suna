@@ -1,6 +1,7 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { threadKeys } from "./keys";
-import { BillingError, AgentRunLimitError, getAgentRuns, unifiedAgentStart, stopAgent, type AgentRun } from "@/lib/api";
+import { getAgentRuns, unifiedAgentStart, stopAgent, type AgentRun } from "@/lib/api/agents";
+import { AgentRunLimitError, BillingError } from "@/lib/api/errors";
 import { useQueryClient } from "@tanstack/react-query";
 
 export const useAgentRunsQuery = (threadId: string, options?) => {
@@ -28,7 +29,7 @@ export const useStartAgentMutation = () => {
       };
     }) => unifiedAgentStart({
       threadId,
-      model_name: options?.model_name,
+      model_name: options?.model_name && options.model_name.trim() ? options.model_name.trim() : undefined,
       agent_id: options?.agent_id,
     }),
     onSuccess: () => {

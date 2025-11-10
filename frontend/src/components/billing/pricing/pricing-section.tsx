@@ -19,19 +19,27 @@ import {
   Diamond,
   Heart,
   Zap,
+  ShoppingCart,
+  Lightbulb,
+  AlertTriangle,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { SubscriptionInfo } from '@/lib/api/billing-v2';
-import { createCheckoutSession, CreateCheckoutSessionRequest, CreateCheckoutSessionResponse } from '@/lib/api';
+import { Badge } from '@/components/ui/badge';
+import { SubscriptionInfo } from '@/lib/api/billing';
+import { createCheckoutSession, CreateCheckoutSessionRequest, CreateCheckoutSessionResponse } from '@/lib/api/billing';
 import { toast } from 'sonner';
 import { isLocalMode } from '@/lib/config';
-import { useSubscription } from '@/hooks/billing';
-import { useSubscriptionCommitment } from '@/hooks/subscriptions/use-subscriptions';
+import { useSubscription, useScheduleDowngrade } from '@/hooks/billing';
+import { useSubscriptionCommitment } from '@/hooks/billing';
 import { useAuth } from '@/components/AuthProvider';
+import { useQueryClient } from '@tanstack/react-query';
+import { billingKeys } from '@/hooks/billing/use-subscription';
 import posthog from 'posthog-js';
-import { Badge } from '@/components/ui/badge';
-import { AnimatedBg } from '@/components/home/ui/AnimatedBg';
+import { AnimatedBg } from '@/components/ui/animated-bg';
 import { TierBadge } from '@/components/billing/tier-badge';
+import { CreditPurchaseModal } from '@/components/billing/credit-purchase';
+import { BorderBeam } from '@/components/ui/border-beam';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 
 // Constants
 export const SUBSCRIPTION_PLANS = {
@@ -160,7 +168,7 @@ function BillingPeriodToggle({
           Yearly
           <span className={cn(
             "px-1.5 py-0.5 rounded-full text-xs font-medium",
-            isYearly 
+            isYearly
               ? "bg-background/90 text-primary"
               : "bg-muted/80 text-primary dark:bg-muted"
           )}>
@@ -185,7 +193,9 @@ function PricingTier({
   returnUrl,
   insideDialog = false,
   billingPeriod = 'monthly' as 'monthly' | 'yearly' | 'yearly_commitment',
-}: PricingTierProps) {
+  currentBillingPeriod = null as 'monthly' | 'yearly' | 'yearly_commitment' | null,
+}: PricingTierProps & { currentBillingPeriod?: 'monthly' | 'yearly' | 'yearly_commitment' | null }) {
+  const queryClient = useQueryClient();
 
   // Determine the price to display based on billing period
   const getDisplayPrice = () => {
@@ -204,15 +214,16 @@ function PricingTier({
       console.log(`[${tier.name}] Yearly: ${tier.yearlyPrice}`);
       return tier.yearlyPrice;
     }
-    
+
     console.log(`[${tier.name}] Monthly: ${tier.price}`);
     return tier.price;
   };
 
   const displayPrice = getDisplayPrice();
 
-  // Handle subscription/trial start
-  const handleSubscribe = async (tierKey: string) => {
+  const scheduleDowngradeMutation = useScheduleDowngrade();
+
+  const handleSubscribe = async (tierKey: string, isDowngrade = false) => {
     if (!isAuthenticated) {
       window.location.href = '/auth?mode=signup';
       return;
@@ -227,6 +238,20 @@ function PricingTier({
       const commitmentType = billingPeriod === 'yearly_commitment' ? 'yearly_commitment' :
         billingPeriod === 'yearly' ? 'yearly' :
           'monthly';
+
+      if (isDowngrade) {
+        scheduleDowngradeMutation.mutate({
+          target_tier_key: tierKey,
+          commitment_type: commitmentType,
+        }, {
+          onSuccess: () => {
+            posthog.capture('plan_downgrade_scheduled');
+            queryClient.invalidateQueries({ queryKey: billingKeys.all });
+            if (onSubscriptionUpdate) onSubscriptionUpdate();
+          }
+        });
+        return;
+      }
 
       const response: CreateCheckoutSessionResponse =
         await createCheckoutSession({
@@ -257,7 +282,13 @@ function PricingTier({
             : 'Subscription updated successfully';
           toast.success(upgradeMessage);
           posthog.capture('plan_upgraded');
+          queryClient.invalidateQueries({ queryKey: billingKeys.all });
           if (onSubscriptionUpdate) onSubscriptionUpdate();
+          if (response.redirect_to_dashboard) {
+            setTimeout(() => {
+              window.location.href = '/dashboard';
+            }, 1000);
+          }
           break;
         case 'commitment_blocks_downgrade':
           toast.warning(response.message || 'Cannot downgrade during commitment period');
@@ -279,6 +310,9 @@ function PricingTier({
             </div>,
           );
           posthog.capture('plan_downgraded');
+          // Invalidate queries to show scheduled change
+          queryClient.invalidateQueries({ queryKey: billingKeys.all });
+          // Trigger subscription update callback to refetch data
           if (onSubscriptionUpdate) onSubscriptionUpdate();
           break;
         case 'no_change':
@@ -307,21 +341,19 @@ function PricingTier({
   );
 
   const userPlanName = currentSubscription?.plan_name || 'none';
-  const isCurrentActivePlan = isAuthenticated && (
-    currentSubscription?.tier_key === tier.tierKey ||
-    currentSubscription?.tier?.name === tier.tierKey ||
-    (userPlanName === 'trial' && tier.price === '$20' && billingPeriod === 'monthly') ||
-    (userPlanName === 'tier_2_20' && tier.price === '$20' && billingPeriod === 'monthly') ||
-    (currentSubscription?.subscription &&
-      userPlanName === 'tier_2_20' &&
-      tier.price === '$20' &&
-      currentSubscription?.subscription?.status === 'active')
-  );
+
+  // Check if this is the current plan - must match BOTH tier_key AND billing period
+  const isSameTier = currentSubscription?.tier_key === tier.tierKey ||
+    currentSubscription?.tier?.name === tier.tierKey;
+  const isSameBillingPeriod = currentBillingPeriod === billingPeriod;
+
+  const isCurrentActivePlan = isAuthenticated && isSameTier && isSameBillingPeriod &&
+    currentSubscription?.subscription?.status === 'active';
 
   const isScheduled = isAuthenticated && (currentSubscription as any)?.has_schedule;
   const isScheduledTargetPlan =
     isScheduled && (
-      (currentSubscription as any)?.scheduled_tier_key === tier.tierKey || 
+      (currentSubscription as any)?.scheduled_tier_key === tier.tierKey ||
       (currentSubscription as any)?.scheduled_plan_name === tier.tierKey ||
       (currentSubscription as any)?.scheduled_plan_name === tier.name
     );
@@ -333,8 +365,9 @@ function PricingTier({
   let ringClass = '';
   let statusBadge = null;
   let buttonClassName = '';
+  let isDowngradeAction = false;
 
-  const planChangeValidation = { allowed: true }; 
+  const planChangeValidation = { allowed: true };
 
   if (isAuthenticated) {
     if (isCurrentActivePlan) {
@@ -400,6 +433,15 @@ function PricingTier({
       const isSameTierUpgradeToLongerTerm = isSameTier && (
         (billingPeriod === 'yearly_commitment' || billingPeriod === 'yearly')
       );
+
+      // Prevent downgrading from yearly to monthly - once yearly, stay yearly
+      // This blocks: yearly -> monthly, yearly_commitment -> monthly for same tier
+      const isYearlyDowngradeToMonthly = isSameTier &&
+        currentBillingPeriod &&
+        (currentBillingPeriod === 'yearly' || currentBillingPeriod === 'yearly_commitment') &&
+        billingPeriod === 'monthly' &&
+        currentSubscription?.subscription?.status === 'active';
+
       const isSameTierDowngradeToShorterTerm = false; // Simplified for now
 
       // Use the plan change validation already computed above
@@ -413,6 +455,12 @@ function PricingTier({
         buttonDisabled = true;
         buttonVariant = 'secondary';
         buttonClassName = 'bg-primary/5 hover:bg-primary/10 text-primary';
+      } else if (isYearlyDowngradeToMonthly) {
+        // Prevent downgrading from yearly to monthly - once yearly, stay yearly
+        buttonText = 'Not Available';
+        buttonDisabled = true;
+        buttonVariant = 'secondary';
+        buttonClassName = 'opacity-50 cursor-not-allowed bg-muted text-muted-foreground';
       } else if (!planChangeValidation.allowed) {
         // Plan change not allowed due to business rules
         buttonText = 'Not Available';
@@ -425,7 +473,7 @@ function PricingTier({
           if (isSameTierUpgradeToLongerTerm && targetAmount <= currentAmount) {
             buttonText = billingPeriod === 'yearly_commitment' ? 'Upgrade' : 'Switch to Legacy Yearly';
             buttonVariant = billingPeriod === 'yearly_commitment' ? tier.buttonColor as ButtonVariant : 'default';
-            buttonClassName = billingPeriod === 'yearly_commitment' 
+            buttonClassName = billingPeriod === 'yearly_commitment'
               ? 'bg-primary hover:bg-primary/90 text-primary-foreground'
               : 'bg-green-600 hover:bg-green-700 text-white';
           } else {
@@ -434,11 +482,10 @@ function PricingTier({
             buttonClassName = 'bg-primary hover:bg-primary/90 text-primary-foreground';
           }
         } else if (targetAmount < currentAmount || isSameTierDowngradeToShorterTerm) {
-          // Prevent downgrades and downgrades to shorter terms
-          buttonText = 'Not Available';
-          buttonDisabled = true;
-          buttonVariant = 'secondary';
-          buttonClassName = 'opacity-50 cursor-not-allowed bg-muted text-muted-foreground';
+          buttonText = 'Downgrade';
+          buttonVariant = 'outline';
+          buttonClassName = '';
+          isDowngradeAction = true;
         } else {
           buttonText = 'Select Plan';
           buttonVariant = tier.buttonColor as ButtonVariant;
@@ -516,16 +563,11 @@ function PricingTier({
         "flex flex-col gap-3 relative z-10",
         insideDialog ? "p-3" : "p-4"
       )}>
-        <div className="flex items-center gap-2">
-          {tier.name === 'Basic' ? (
-            // For Basic plan, just show plain text
-            <span className="text-lg font-semibold">Basic</span>
-          ) : (
-            <TierBadge planName={tier.name} size="lg" variant="default" />
-          )}
+        <div className="flex items-center justify-between gap-2">
+          <TierBadge planName={tier.name} size="lg" variant="default" />
           <div className="flex items-center gap-2">
             {tier.isPopular && (
-              <Badge variant='outline'>Popular</Badge>
+              <Badge variant='default'>Popular</Badge>
             )}
             {/* Show upgrade badge for yearly commitment plans when user is on monthly */}
             {isAuthenticated && statusBadge}
@@ -598,7 +640,7 @@ function PricingTier({
         insideDialog ? "px-3 pt-1 pb-3" : "px-4 pt-2 pb-4"
       )}>
         <Button
-          onClick={() => handleSubscribe(tier.tierKey)}
+          onClick={() => handleSubscribe(tier.tierKey, isDowngradeAction)}
           disabled={buttonDisabled}
           variant={buttonVariant || 'default'}
           className={cn(
@@ -612,6 +654,29 @@ function PricingTier({
           {buttonText}
         </Button>
       </div>
+
+      {/* BorderBeam for Ultra plan only - dual tracers in sync */}
+      {isUltraPlan && (
+        <>
+          <BorderBeam
+            size={200}
+            duration={12}
+            delay={0}
+            borderWidth={1.5}
+            colorFrom="#23D3FF"
+            colorTo="#FF1B07"
+          />
+          <BorderBeam
+            size={200}
+            duration={12}
+            delay={0}
+            borderWidth={1.5}
+            colorFrom="#FFC78C"
+            colorTo="#FDF5E0"
+            initialOffset={50}
+          />
+        </>
+      )}
     </div>
   );
 }
@@ -624,6 +689,8 @@ interface PricingSectionProps {
   noPadding?: boolean;
   onSubscriptionUpdate?: () => void;
   customTitle?: string;
+  isAlert?: boolean;
+  alertTitle?: string;
 }
 
 export function PricingSection({
@@ -634,28 +701,69 @@ export function PricingSection({
   noPadding = false,
   onSubscriptionUpdate,
   customTitle,
+  isAlert = false,
+  alertTitle
 }: PricingSectionProps) {
   const { user } = useAuth();
   const isUserAuthenticated = !!user;
+  const queryClient = useQueryClient();
 
-  const { data: subscriptionData, isLoading: isFetchingPlan, error: subscriptionQueryError, refetch: refetchSubscription } = useSubscription(isUserAuthenticated);
+  const { data: subscriptionData, isLoading: isFetchingPlan, error: subscriptionQueryError, refetch: refetchSubscription } = useSubscription({ enabled: isUserAuthenticated });
   const subCommitmentQuery = useSubscriptionCommitment(subscriptionData?.subscription?.id, isUserAuthenticated);
 
   const isAuthenticated = isUserAuthenticated && !!subscriptionData && subscriptionQueryError === null;
   const currentSubscription = subscriptionData || null;
+
+  // Determine current subscription's billing period
+  const getCurrentBillingPeriod = (): 'monthly' | 'yearly' | 'yearly_commitment' | null => {
+    if (!isAuthenticated || !currentSubscription) {
+      return null;
+    }
+
+    // Use billing_period from API response (most reliable - comes from price_id)
+    if (currentSubscription.billing_period) {
+      return currentSubscription.billing_period;
+    }
+
+    // Fallback: Check commitment info
+    if (subCommitmentQuery.data?.has_commitment &&
+      subCommitmentQuery.data?.commitment_type === 'yearly_commitment') {
+      return 'yearly_commitment';
+    }
+
+    // Fallback: Try to infer from period length
+    if (currentSubscription.subscription?.current_period_end) {
+      const periodEnd = typeof currentSubscription.subscription.current_period_end === 'number'
+        ? currentSubscription.subscription.current_period_end * 1000
+        : new Date(currentSubscription.subscription.current_period_end).getTime();
+
+      const now = Date.now();
+      const daysInPeriod = Math.round((periodEnd - now) / (1000 * 60 * 60 * 24));
+
+      // If period is longer than 180 days, likely yearly; otherwise monthly
+      if (daysInPeriod > 180) {
+        return 'yearly';
+      }
+    }
+
+    // Default to monthly if period is short or can't determine
+    return 'monthly';
+  };
+
+  const currentBillingPeriod = getCurrentBillingPeriod();
 
   const getDefaultBillingPeriod = useCallback((): 'monthly' | 'yearly' | 'yearly_commitment' => {
     if (!isAuthenticated || !currentSubscription) {
       return 'yearly_commitment';
     }
 
-    // Default to yearly_commitment for now
-    // Backend will resolve tier_key to the appropriate Stripe price_id internally based on commitment_type
-    return 'yearly_commitment';
-  }, [isAuthenticated, currentSubscription]);
+    // Use current subscription's billing period if available, otherwise default to yearly_commitment
+    return currentBillingPeriod || 'yearly_commitment';
+  }, [isAuthenticated, currentSubscription, currentBillingPeriod]);
 
   const [billingPeriod, setBillingPeriod] = useState<'monthly' | 'yearly' | 'yearly_commitment'>(getDefaultBillingPeriod());
   const [planLoadingStates, setPlanLoadingStates] = useState<Record<string, boolean>>({});
+  const [showCreditPurchaseModal, setShowCreditPurchaseModal] = useState(false);
 
   useEffect(() => {
     setBillingPeriod(getDefaultBillingPeriod());
@@ -666,9 +774,12 @@ export function PricingSection({
   };
 
   const handleSubscriptionUpdate = () => {
+    // Invalidate all billing-related queries to force refetch
+    queryClient.invalidateQueries({ queryKey: billingKeys.all });
+    // Also refetch subscription and commitment directly
     refetchSubscription();
     subCommitmentQuery.refetch();
-    // The useSubscription hook will automatically refetch, so we just need to clear loading states
+    // Clear loading states
     setTimeout(() => {
       setPlanLoadingStates({});
     }, 1000);
@@ -696,14 +807,23 @@ export function PricingSection({
       className={cn("flex flex-col items-center justify-center w-full relative", noPadding ? "pb-0" : "pb-12")}
     >
       <div className="w-full mx-auto px-6 flex flex-col items-center">
-        {showTitleAndTabs && (
+        {isAlert && (
+          <div className="w-full flex justify-center mb-6 gap-4">
+            <div className="h-10 w-10 rounded-full bg-amber-600/10 border border-amber-600/20 dark:bg-amber-500/10 dark:border-amber-500/20 flex items-center justify-center">
+              <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-500" />
+            </div>
+            <h2 className="text-3xl font-medium tracking-tight text-center text-balance leading-tight max-w-2xl text-amber-600 dark:text-amber-500">
+              {alertTitle || 'Pick the plan that works for you.'}
+            </h2>
+          </div>
+        )}
+        {showTitleAndTabs && !isAlert && (
           <div className="w-full flex justify-center mb-6">
-            <h2 className="text-3xl md:text-4xl font-medium tracking-tight text-center text-balance leading-tight max-w-2xl">
+            <h2 className="text-3xl font-medium tracking-tight text-center text-balance leading-tight max-w-2xl">
               {customTitle || 'Pick the plan that works for you.'}
             </h2>
           </div>
         )}
-
         <div className="flex justify-center mb-8">
           <BillingPeriodToggle
             billingPeriod={billingPeriod}
@@ -733,10 +853,59 @@ export function PricingSection({
                 returnUrl={returnUrl}
                 insideDialog={insideDialog}
                 billingPeriod={billingPeriod}
+                currentBillingPeriod={currentBillingPeriod}
               />
             ))}
         </div>
+
+        {/* Get Additional Credits Button - Only visible if tier allows credit purchases */}
+        {isAuthenticated &&
+          currentSubscription?.credits?.can_purchase_credits && (
+            <div className="w-full max-w-6xl mt-12 flex flex-col items-center gap-4">
+              <Button
+                onClick={() => setShowCreditPurchaseModal(true)}
+                variant="outline"
+                size="lg"
+                className="gap-2"
+              >
+                <ShoppingCart className="h-5 w-5" />
+                Get Additional Credits
+              </Button>
+              {/* Credits Explained Link */}
+              <Button
+                variant="link"
+                onClick={() => window.open('/credits-explained', '_blank')}
+                className="text-muted-foreground hover:text-foreground h-auto p-0"
+              >
+                <Lightbulb className="h-3.5 w-3.5 mr-2" />
+                <span className="text-sm">Credits explained</span>
+              </Button>
+            </div>
+          )}
+
+        {/* Credits Explained Link - Show when not authenticated or when credits purchase is not available */}
+        {(!isAuthenticated || !currentSubscription?.credits?.can_purchase_credits) && (
+          <div className="w-full max-w-6xl mt-8 flex justify-center">
+            <Button
+              variant="link"
+              onClick={() => window.open('/credits-explained', '_blank')}
+              className="text-muted-foreground hover:text-foreground h-auto p-0"
+            >
+              <Lightbulb className="h-3.5 w-3.5 mr-2" />
+              <span className="text-sm">Credits explained</span>
+            </Button>
+          </div>
+        )}
       </div>
+
+      {/* Credit Purchase Modal */}
+      <CreditPurchaseModal
+        open={showCreditPurchaseModal}
+        onOpenChange={setShowCreditPurchaseModal}
+        currentBalance={currentSubscription?.credits?.balance || 0}
+        canPurchase={currentSubscription?.credits?.can_purchase_credits || false}
+        onPurchaseComplete={handleSubscriptionUpdate}
+      />
     </section>
   );
 }

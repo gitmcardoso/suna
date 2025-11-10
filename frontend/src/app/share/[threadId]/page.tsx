@@ -1,36 +1,19 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { toast } from 'sonner';
-import { ThreadContent } from '@/components/thread/content/ThreadContent';
-import {
-  PlaybackControls,
-  PlaybackController,
-} from '@/components/thread/content/PlaybackControls';
+import dynamic from 'next/dynamic';
+import { SharePageWrapper } from './_components/SharePageWrapper';
+import React from 'react';
 import {
   UnifiedMessage,
   ParsedMetadata,
-  ParsedContent,
   ThreadParams,
 } from '@/components/thread/types';
-import { safeJsonParse } from '@/components/thread/utils';
-import { useAgentStream } from '@/hooks/agents';
-import { ThreadSkeleton } from '@/components/thread/content/ThreadSkeleton';
-import { extractToolName } from '@/components/thread/tool-views/xml-parser';
-import { ToolCallInput } from '@/components/thread/tool-call-side-panel';
 
-// Share-specific imports
-import { useShareThreadData } from './_hooks/useShareThreadData';
-import { ShareThreadLayout } from './_components/ShareThreadLayout';
-
-interface StreamingToolCall {
-  id?: string;
-  name?: string;
-  arguments?: string;
-  index?: number;
-  xml_tag_name?: string;
-}
+// Dynamic import to avoid SSR issues with browser-only dependencies
+const ThreadComponent = dynamic(
+  () => import('@/components/thread/ThreadComponent').then(mod => ({ default: mod.ThreadComponent })),
+  { ssr: false }
+);
 
 export default function ShareThreadPage({
   params,
@@ -286,9 +269,7 @@ export default function ShareThreadPage({
     );
 
     assistantMessages.forEach((assistantMsg) => {
-      // Find ALL tool result messages that match this assistant message
-      // (one assistant message can have multiple tool calls)
-      const resultMessages = messages.filter((toolMsg) => {
+      const resultMessage = messages.find((toolMsg) => {
         if (toolMsg.type !== 'tool' || !toolMsg.metadata || !assistantMsg.message_id) return false;
         try {
           const metadata = safeJsonParse<ParsedMetadata>(toolMsg.metadata, {});
@@ -298,94 +279,7 @@ export default function ShareThreadPage({
         }
       });
 
-      // Parse assistant message to get tool_calls array
-      let assistantToolCalls: Array<{ id?: string; function?: { name?: string; arguments?: any }; name?: string }> = [];
-      try {
-        const assistantContentParsed = safeJsonParse<ParsedContent>(assistantMsg.content, {});
-        if (assistantContentParsed.tool_calls && Array.isArray(assistantContentParsed.tool_calls)) {
-          assistantToolCalls = assistantContentParsed.tool_calls;
-        }
-      } catch { }
-
-      // If we have tool calls in the assistant message, match each tool result to its tool call
-      if (assistantToolCalls.length > 0 && resultMessages.length > 0) {
-        // Match tool results to tool calls by tool_call_id
-        assistantToolCalls.forEach((toolCall) => {
-          const toolCallId = toolCall.id;
-          const resultMessage = toolCallId 
-            ? resultMessages.find((toolMsg) => {
-                try {
-                  const parsedContent = safeJsonParse<ParsedContent>(toolMsg.content, {});
-                  return parsedContent.tool_call_id === toolCallId;
-                } catch {
-                  return false;
-                }
-              })
-            : resultMessages[0]; // Fallback to first result if no ID
-
-          if (resultMessage) {
-            const toolName = (toolCall.function?.name || toolCall.name || 'unknown').replace(/_/g, '-').toLowerCase();
-            let isSuccess = true;
-            let extractedToolContent = resultMessage.content;
-            
-            // Extract actual content from native tool result format
-            // Native tool results are stored as: {"role": "tool", "tool_call_id": "...", "name": "...", "content": "actual output"}
-            try {
-              const parsed = safeJsonParse<ParsedContent>(resultMessage.content, {});
-              // If it's a native tool format with role and content, extract the content
-              if (parsed.role === 'tool' && parsed.content !== undefined) {
-                // The content field contains the actual tool output
-                extractedToolContent = typeof parsed.content === 'string' 
-                  ? parsed.content 
-                  : JSON.stringify(parsed.content);
-              }
-            } catch {
-              // If parsing fails, use original content
-            }
-            
-            try {
-              const toolResultContent = (() => {
-                try {
-                  const parsed = safeJsonParse<ParsedContent>(resultMessage.content, {});
-                  // For native tool format, check the content field
-                  if (parsed.role === 'tool' && parsed.content !== undefined) {
-                    return typeof parsed.content === 'string' ? parsed.content : JSON.stringify(parsed.content);
-                  }
-                  return parsed.content || resultMessage.content;
-                } catch {
-                  return resultMessage.content;
-                }
-              })();
-              if (toolResultContent && typeof toolResultContent === 'string') {
-                const toolResultMatch = toolResultContent.match(/ToolResult\s*\(\s*success\s*=\s*(True|False|true|false)/i);
-                if (toolResultMatch) {
-                  isSuccess = toolResultMatch[1].toLowerCase() === 'true';
-                } else {
-                  const toolContent = toolResultContent.toLowerCase();
-                  isSuccess = !(toolContent.includes('failed') ||
-                    toolContent.includes('error') ||
-                    toolContent.includes('failure'));
-                }
-              }
-            } catch { }
-
-            historicalToolPairs.push({
-              assistantCall: {
-                name: toolName,
-                content: assistantMsg.content,
-                timestamp: assistantMsg.created_at,
-              },
-              toolResult: {
-                content: extractedToolContent, // Use extracted content instead of raw JSON
-                isSuccess: isSuccess,
-                timestamp: resultMessage.created_at,
-              },
-            });
-          }
-        });
-      } else if (resultMessages.length > 0) {
-        // Fallback: No tool_calls array found, use old matching logic (single tool per assistant message)
-        const resultMessage = resultMessages[0];
+      if (resultMessage) {
         let toolName = 'unknown';
         try {
           const assistantContent = (() => {
@@ -415,30 +309,10 @@ export default function ShareThreadPage({
         } catch { }
 
         let isSuccess = true;
-        let extractedToolContent = resultMessage.content;
-        
-        // Extract actual content from native tool result format
-        try {
-          const parsed = safeJsonParse<ParsedContent>(resultMessage.content, {});
-          // If it's a native tool format with role and content, extract the content
-          if (parsed.role === 'tool' && parsed.content !== undefined) {
-            // The content field contains the actual tool output
-            extractedToolContent = typeof parsed.content === 'string' 
-              ? parsed.content 
-              : JSON.stringify(parsed.content);
-          }
-        } catch {
-          // If parsing fails, use original content
-        }
-        
         try {
           const toolResultContent = (() => {
             try {
-              const parsed = safeJsonParse<ParsedContent>(resultMessage.content, {});
-              // For native tool format, check the content field
-              if (parsed.role === 'tool' && parsed.content !== undefined) {
-                return typeof parsed.content === 'string' ? parsed.content : JSON.stringify(parsed.content);
-              }
+              const parsed = safeJsonParse<{ content?: string }>(resultMessage.content, {});
               return parsed.content || resultMessage.content;
             } catch {
               return resultMessage.content;
@@ -464,7 +338,7 @@ export default function ShareThreadPage({
             timestamp: assistantMsg.created_at,
           },
           toolResult: {
-            content: extractedToolContent, // Use extracted content instead of raw JSON
+            content: resultMessage.content,
             isSuccess: isSuccess,
             timestamp: resultMessage.created_at,
           },
@@ -658,84 +532,8 @@ export default function ShareThreadPage({
     return (
       <ShareThreadLayout
         threadId={threadId}
-        projectId={project?.id || ''}
-        projectName="Shared Conversation"
-        project={null}
-        sandboxId={null}
-        isSidePanelOpen={isSidePanelOpen}
-        onToggleSidePanel={toggleSidePanel}
-        onViewFiles={handleOpenFileViewer}
-        fileViewerOpen={fileViewerOpen}
-        setFileViewerOpen={setFileViewerOpen}
-        fileToView={fileToView}
-        toolCalls={toolCalls}
-        messages={messages}
-        externalNavIndex={externalNavIndex}
-        agentStatus={agentStatus}
-        currentToolIndex={currentToolIndex}
-        onSidePanelNavigate={handleSidePanelNavigate}
-        onSidePanelClose={() => {
-          setIsSidePanelOpen(false);
-          userClosedPanelRef.current = true;
-        }}
-        initialLoadCompleted={initialLoadCompleted}
-      >
-        <div className="flex flex-1 items-center justify-center p-4">
-          <div className="flex w-full max-w-md flex-col items-center gap-4 rounded-lg border bg-card p-6 text-center">
-            <h2 className="text-lg font-semibold text-destructive">Error</h2>
-            <p className="text-sm text-muted-foreground">{error}</p>
-            <button
-              className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground"
-              onClick={() => router.push('/')}
-            >
-              Back to Home
-            </button>
-          </div>
-        </div>
-      </ShareThreadLayout>
-    );
-  }
-
-  return (
-    <ShareThreadLayout
-      threadId={threadId}
-      projectId={project?.id || ''}
-      projectName={projectName || 'Shared Conversation'}
-      project={project}
-      sandboxId={sandboxId}
-      isSidePanelOpen={isSidePanelOpen}
-      onToggleSidePanel={toggleSidePanel}
-      onViewFiles={handleOpenFileViewer}
-      fileViewerOpen={fileViewerOpen}
-      setFileViewerOpen={setFileViewerOpen}
-      fileToView={fileToView}
-      toolCalls={toolCalls}
-      messages={messages}
-      externalNavIndex={externalNavIndex}
-      agentStatus={agentStatus}
-      currentToolIndex={currentToolIndex}
-      onSidePanelNavigate={handleSidePanelNavigate}
-      onSidePanelClose={() => {
-        setIsSidePanelOpen(false);
-        userClosedPanelRef.current = true;
-      }}
-      initialLoadCompleted={initialLoadCompleted}
-    >
-      <ThreadContent
-        messages={messages}
-        agentStatus={agentStatus}
-        handleToolClick={handleToolClick}
-        handleOpenFileViewer={handleOpenFileViewer}
-        readOnly={true}
-        visibleMessages={playbackState.visibleMessages}
-        streamingText={playbackState.streamingText}
-        isStreamingText={playbackState.isStreamingText}
-        currentToolCall={playbackState.currentToolCall}
-        sandboxId={sandboxId || ''}
-        project={project}
+        isShared={true}
       />
-      {renderWelcomeOverlay()}
-      {renderFloatingControls()}
-    </ShareThreadLayout>
+    </SharePageWrapper>
   );
 }

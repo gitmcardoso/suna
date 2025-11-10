@@ -1,7 +1,7 @@
 'use client';
 
 import * as React from 'react';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import {
     Dialog,
     DialogContent,
@@ -20,6 +20,8 @@ import {
     TrendingDown,
     ExternalLink,
     Info,
+    FileText,
+    Plug,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { createClient } from '@/lib/supabase/client';
@@ -28,22 +30,27 @@ import { isLocalMode } from '@/lib/config';
 import { LocalEnvManager } from '@/components/env-manager/local-env-manager';
 import { useIsMobile } from '@/hooks/utils';
 import { SpotlightCard } from '@/components/ui/spotlight-card';
+import { useQueryClient } from '@tanstack/react-query';
 import { 
     useAccountDeletionStatus, 
     useRequestAccountDeletion, 
     useCancelAccountDeletion 
 } from '@/hooks/account/use-account-deletion';
-import {
-    getSubscription,
-    createPortalSession,
-    cancelSubscription,
-    reactivateSubscription,
-    SubscriptionStatus,
-} from '@/lib/api';
+import { SubscriptionInfo } from '@/lib/api/billing';
 import { useAuth } from '@/components/AuthProvider';
 import { PlanSelectionModal, PricingSection } from '@/components/billing/pricing';
 import { CreditBalanceDisplay, CreditPurchaseModal } from '@/components/billing/credit-purchase';
-import { useSubscriptionCommitment } from '@/hooks/subscriptions/use-subscriptions';
+import { ScheduledDowngradeCard } from '@/components/billing/scheduled-downgrade-card';
+import { 
+    useSubscription, 
+    useSubscriptionCommitment, 
+    useCreatePortalSession,
+    useCancelSubscription,
+    useReactivateSubscription,
+    useCreditBalance,
+    useScheduledChanges,
+    billingKeys
+} from '@/hooks/billing';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Badge } from '@/components/ui/badge';
@@ -54,14 +61,17 @@ import {
     Shield,
     CheckCircle,
     RotateCcw,
-    Clock
+    Clock,
+    Infinity,
+    ShoppingCart,
+    Lightbulb
 } from 'lucide-react';
-import { useQueryClient } from '@tanstack/react-query';
 import { AlertDialog, AlertDialogContent, AlertDialogHeader, AlertDialogTitle } from '../ui/alert-dialog';
 import { getPlanName, getPlanIcon } from '../billing/plan-utils';
 import ThreadUsage from '@/components/billing/thread-usage';
+import { formatCredits } from '@/lib/utils/credit-formatter';
 
-type TabId = 'general' | 'plan' | 'billing' | 'usage' | 'env-manager';
+type TabId = 'general' | 'plan' | 'billing' | 'usage' | 'env-manager' | 'knowledge-base' | 'integrations';
 
 interface Tab {
     id: TabId;
@@ -90,6 +100,8 @@ export function UserSettingsModal({
         { id: 'plan', label: 'Plan', icon: Zap },
         { id: 'billing', label: 'Billing', icon: CreditCard },
         { id: 'usage', label: 'Usage', icon: TrendingDown },
+        { id: 'knowledge-base', label: 'Knowledge Base', icon: FileText },
+        { id: 'integrations', label: 'Integrations', icon: Plug },
         ...(isLocal ? [{ id: 'env-manager' as TabId, label: 'Env Manager', icon: KeyRound }] : []),
     ];
     
@@ -100,6 +112,10 @@ export function UserSettingsModal({
     const handleTabClick = (tabId: TabId) => {
         if (tabId === 'plan') {
             setShowPlanModal(true);
+        } else if (tabId === 'knowledge-base') {
+            window.open('/knowledge', '_blank');
+        } else if (tabId === 'integrations') {
+            window.open('/settings/credentials', '_blank');
         } else {
             setActiveTab(tabId);
         }
@@ -183,9 +199,11 @@ export function UserSettingsModal({
                     </div>
                     <div className="flex-1 overflow-y-auto">
                         {activeTab === 'general' && <GeneralTab onClose={() => onOpenChange(false)} />}
-                        {activeTab === 'billing' && <BillingTab returnUrl={returnUrl} onOpenPlanModal={() => setShowPlanModal(true)} />}
+                        {activeTab === 'billing' && <BillingTab returnUrl={returnUrl} onOpenPlanModal={() => setShowPlanModal(true)} isActive={activeTab === 'billing'} />}
                         {activeTab === 'usage' && <UsageTab />}
                         {activeTab === 'env-manager' && isLocal && <EnvManagerTab />}
+                        {activeTab === 'knowledge-base' && <KnowledgeBaseTab />}
+                        {activeTab === 'integrations' && <IntegrationsTab />}
                     </div>
                 </div>
 
@@ -476,56 +494,102 @@ function GeneralTab({ onClose }: { onClose: () => void }) {
 }
 
 // Billing Tab Component - Usage, credits, subscription management
-function BillingTab({ returnUrl, onOpenPlanModal }: { returnUrl: string; onOpenPlanModal: () => void }) {
+function BillingTab({ returnUrl, onOpenPlanModal, isActive }: { returnUrl: string; onOpenPlanModal: () => void; isActive: boolean }) {
     const { session, isLoading: authLoading } = useAuth();
-    const queryClient = useQueryClient();
-    const [subscriptionData, setSubscriptionData] = useState<SubscriptionStatus | null>(null);
-    const [isLoading, setIsLoading] = useState(true);
-    const [error, setError] = useState<string | null>(null);
-    const [isManaging, setIsManaging] = useState(false);
     const [showCreditPurchaseModal, setShowCreditPurchaseModal] = useState(false);
     const [showCancelDialog, setShowCancelDialog] = useState(false);
-    const [isCancelling, setIsCancelling] = useState(false);
+    const queryClient = useQueryClient();
 
     const isLocal = isLocalMode();
-    const planName = getPlanName(subscriptionData, isLocal);
-    const planIcon = getPlanIcon(planName, isLocal);
+
+    // Use React Query hooks for subscription data
+    const {
+        data: subscriptionData,
+        isLoading: isLoadingSubscription,
+        error: subscriptionError,
+        refetch: refetchSubscription
+    } = useSubscription({
+        enabled: !!session && !authLoading,
+    });
 
     const {
         data: commitmentInfo,
         isLoading: commitmentLoading,
         error: commitmentError,
         refetch: refetchCommitment
-    } = useSubscriptionCommitment(subscriptionData?.subscription?.id || null);
+    } = useSubscriptionCommitment(subscriptionData?.subscription?.id, !!subscriptionData?.subscription?.id);
 
-    const fetchSubscriptionData = async () => {
-        if (!session) return;
+    const {
+        data: creditBalance,
+        isLoading: isLoadingBalance,
+        refetch: refetchBalance
+    } = useCreditBalance(!!session && !authLoading);
 
-        try {
-            setIsLoading(true);
-            const data = await getSubscription();
-            setSubscriptionData(data);
-            setError(null);
-            return data;
-        } catch (err) {
-            console.error('Failed to get subscription:', err);
-            setError(err instanceof Error ? err.message : 'Failed to load subscription data');
-        } finally {
-            setIsLoading(false);
-        }
+    const {
+        data: scheduledChangesData,
+        refetch: refetchScheduledChanges
+    } = useScheduledChanges(!!session && !authLoading);
+
+    const createPortalSessionMutation = useCreatePortalSession();
+    const cancelSubscriptionMutation = useCancelSubscription();
+    const reactivateSubscriptionMutation = useReactivateSubscription();
+
+    const planName = getPlanName(subscriptionData, isLocal);
+    const planIcon = getPlanIcon(planName, isLocal);
+
+    // Calculate days until refresh
+    const getDaysUntilRefresh = () => {
+        if (!creditBalance?.next_credit_grant) return null;
+        const nextGrant = new Date(creditBalance.next_credit_grant);
+        const now = new Date();
+        const diffTime = nextGrant.getTime() - now.getTime();
+        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+        return diffDays > 0 ? diffDays : null;
     };
 
-    useEffect(() => {
-        if (authLoading || !session) return;
-        fetchSubscriptionData();
-    }, [session, authLoading]);
+    const daysUntilRefresh = getDaysUntilRefresh();
+    const expiringCredits = creditBalance?.expiring_credits || 0;
+    const nonExpiringCredits = creditBalance?.non_expiring_credits || 0;
+    const totalCredits = creditBalance?.balance || 0;
 
-    const formatDate = (timestamp: number) => {
+    // Refetch billing info whenever the billing tab becomes active (only once per activation)
+    const prevIsActiveRef = useRef(false);
+    useEffect(() => {
+        // Only refetch if tab just became active (not on every render)
+        if (isActive && !prevIsActiveRef.current && session && !authLoading) {
+            console.log('🔄 Billing tab activated, refetching billing info...');
+            // Use queryClient to invalidate instead of individual refetches to avoid cascading
+            // This will trigger refetches but React Query will dedupe concurrent requests
+            queryClient.invalidateQueries({ queryKey: billingKeys.all });
+        }
+        prevIsActiveRef.current = isActive;
+        // Only depend on isActive, session, and authLoading - not the refetch functions
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [isActive, session, authLoading]);
+
+    const formatDate = (dateString: string) => {
+        return new Date(dateString).toLocaleDateString('en-US', {
+            year: 'numeric',
+            month: 'long',
+            day: 'numeric',
+        });
+    };
+
+    const formatDateFromTimestamp = (timestamp: number) => {
         return new Date(timestamp * 1000).toLocaleDateString('en-US', {
             year: 'numeric',
             month: 'long',
             day: 'numeric',
         });
+    };
+
+    const formatDateFlexible = (dateValue: string | number) => {
+        if (typeof dateValue === 'number') {
+            // If it's a number, treat it as Unix timestamp (seconds)
+            return formatDateFromTimestamp(dateValue);
+        }
+        // Otherwise treat it as ISO string
+        return formatDate(dateValue);
     };
 
     const formatEndDate = (dateString: string) => {
@@ -542,97 +606,35 @@ function BillingTab({ returnUrl, onOpenPlanModal }: { returnUrl: string; onOpenP
 
     const getEffectiveCancellationDate = () => {
         if (subscriptionData?.subscription?.cancel_at) {
-            return formatDate(subscriptionData.subscription.cancel_at);
+            const cancelAt = subscriptionData.subscription.cancel_at;
+            if (typeof cancelAt === 'number') {
+                return formatDateFromTimestamp(cancelAt);
+            }
+            return formatDate(cancelAt);
         }
-        return formatDate(subscriptionData?.subscription?.current_period_end || 0);
+        if (subscriptionData?.subscription?.current_period_end) {
+            return formatDateFlexible(subscriptionData.subscription.current_period_end);
+        }
+        return 'N/A';
     };
 
-    const handleManageSubscription = async () => {
-        try {
-            setIsManaging(true);
-            const { url } = await createPortalSession({ return_url: returnUrl });
-            window.location.href = url;
-        } catch (err) {
-            console.error('Failed to create portal session:', err);
-            setError(err instanceof Error ? err.message : 'Failed to create portal session');
-        } finally {
-            setIsManaging(false);
-        }
+    const handleManageSubscription = () => {
+        createPortalSessionMutation.mutate({ return_url: returnUrl });
     };
 
-    const handleCancel = async () => {
-        setIsCancelling(true);
-        const originalState = subscriptionData;
-
-        try {
-            setShowCancelDialog(false);
-
-            if (subscriptionData?.subscription) {
-                const optimisticState = {
-                    ...subscriptionData,
-                    subscription: {
-                        ...subscriptionData.subscription,
-                        cancel_at_period_end: true,
-                        ...(commitmentInfo?.has_commitment && commitmentInfo.commitment_end_date ? {
-                            cancel_at: Math.floor(new Date(commitmentInfo.commitment_end_date).getTime() / 1000)
-                        } : {})
-                    }
-                };
-                setSubscriptionData(optimisticState);
-            }
-
-            const response = await cancelSubscription();
-
-            if (response.success) {
-                toast.success(response.message);
-            } else {
-                setSubscriptionData(originalState);
-                toast.error(response.message);
-            }
-        } catch (error: any) {
-            console.error('Error cancelling subscription:', error);
-            setSubscriptionData(originalState);
-            toast.error(error.message || 'Failed to cancel subscription');
-        } finally {
-            setIsCancelling(false);
-        }
+    const handleCancel = () => {
+        setShowCancelDialog(false);
+        cancelSubscriptionMutation.mutate(undefined);
     };
 
-    const handleReactivate = async () => {
-        setIsCancelling(true);
-        const originalState = subscriptionData;
-
-        try {
-            if (subscriptionData?.subscription) {
-                const optimisticState = {
-                    ...subscriptionData,
-                    subscription: {
-                        ...subscriptionData.subscription,
-                        cancel_at_period_end: false,
-                        cancel_at: undefined
-                    }
-                };
-                setSubscriptionData(optimisticState);
-            }
-
-            const response = await reactivateSubscription();
-
-            if (response.success) {
-                toast.success(response.message);
-            } else {
-                setSubscriptionData(originalState);
-                toast.error(response.message);
-            }
-        } catch (error: any) {
-            console.error('Error reactivating subscription:', error);
-            setSubscriptionData(originalState);
-            toast.error(error.message || 'Failed to reactivate subscription');
-        } finally {
-            setIsCancelling(false);
-        }
+    const handleReactivate = () => {
+        reactivateSubscriptionMutation.mutate();
     };
 
-    if (isLoading || authLoading) {
+    const isLoading = isLoadingSubscription || isLoadingBalance || authLoading;
+    const error = subscriptionError ? (subscriptionError instanceof Error ? subscriptionError.message : 'Failed to load subscription data') : null;
+
+    if (isLoading) {
         return (
             <div className="p-6 space-y-6">
                 <Skeleton className="h-8 w-32" />
@@ -674,140 +676,198 @@ function BillingTab({ returnUrl, onOpenPlanModal }: { returnUrl: string; onOpenP
     const isSubscribed = subscriptionData?.subscription?.status === 'active' || subscriptionData?.subscription?.status === 'trialing';
     const isFreeTier = subscriptionData?.tier?.name === 'free';
     const subscription = subscriptionData?.subscription;
-    const isCancelled = subscription?.cancel_at_period_end || subscription?.cancel_at;
+    const isCancelled = subscription?.cancel_at_period_end || subscription?.cancel_at || subscription?.canceled_at;
+    const canPurchaseCredits = subscriptionData?.credits?.can_purchase_credits || false;
 
     return (
-        <div className="p-6 space-y-6">
-            {(isSubscribed || isFreeTier) && (
-                <Card className="shadow-none">
-                    <CardHeader>
-                        <div className="flex items-center justify-between">
-                            <CardTitle className="text-lg">Current Plan</CardTitle>
-                            {isCancelled ? (
-                                <Badge variant="outline" className="bg-yellow-500/10 text-yellow-500 border-yellow-500/20">
-                                    <Clock className="h-3 w-3 mr-1" />
-                                    Cancelling
-                                </Badge>
-                            ) : isFreeTier ? (
-                                <Badge variant="outline" className="bg-blue-500/10 text-blue-500 border-blue-500/20">
-                                    <Zap className="h-3 w-3" />
-                                    Basic
-                                </Badge>
-                            ) : (
-                                <Badge variant="outline" className="bg-green-500/10 text-green-500 border-green-500/20">
-                                    <CheckCircle className="h-3 w-3 mr-1" />
-                                    Active
-                                </Badge>
-                            )}
-                        </div>
-                    </CardHeader>
-                    <CardContent className="space-y-4">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                {!isFreeTier && planName && planIcon ? (
-                                    <div className="flex items-center gap-2">
-                                    <>
-                                        <div className="bg-black dark:hidden rounded-full px-2 py-0.5 flex items-center justify-center w-fit">
-                                        <img
-                                            src={planIcon}
-                                            alt={planName}
-                                            className="flex-shrink-0 h-[16px] w-auto"
-                                        />
-                                        </div>
-                                        <img
-                                        src={planIcon}
-                                        alt={planName}
-                                        className="flex-shrink-0 h-[16px] w-auto hidden dark:block"
-                                        />
-                                    </>
-                                        <span className="ml-2 font-medium">{planName}</span>
-                                    </div>
-                                ) : (
-                                    <span className="font-medium">{planName || 'Basic'}</span>
-                                )}
-                                {subscription?.current_period_end && (
-                                    <div className="text-sm text-muted-foreground mt-1">
-                                        Next billing date: {formatDate(subscription.current_period_end)}
-                            </div>
-                                )}
-                            </div>
-                            <Button
-                                variant="outline"
-                                onClick={onOpenPlanModal}
-                                className="ml-4"
-                            >
-                                <Zap className="h-4 w-4 mr-2" />
-                                Change Plan
-                            </Button>
-                        </div>
-                        {commitmentInfo?.has_commitment && (
-                            <Alert className="border-blue-500/50 bg-blue-500/10 shadow-none">
-                                <Shield className="h-4 w-4 text-blue-500" />
-                                <AlertDescription>
-                                    <div className="text-sm">
-                                        <strong>Annual Commitment Active</strong>
-                                        <p className="text-muted-foreground mt-1">
-                                            Your commitment ends on {formatEndDate(commitmentInfo.commitment_end_date)}
-                                        </p>
-                                    </div>
-                                </AlertDescription>
-                            </Alert>
-                        )}
-                        {isCancelled && (
-                            <Alert variant="destructive" className="shadow-none">
-                                <AlertTriangle className="h-4 w-4" />
-                                <AlertDescription>
-                                    <div className="text-sm">
-                                        Your subscription will be cancelled on {getEffectiveCancellationDate()}
-                                    </div>
-                                </AlertDescription>
-                            </Alert>
-                        )}
+        <div className="p-6 space-y-8">
+            {/* Header with Plan Badge on Right */}
+            <div className="flex items-start justify-between gap-4">
+                <div className="space-y-1">
+                    <h1 className="text-2xl font-medium tracking-tight">Billing Status</h1>
+                    <p className="text-sm text-muted-foreground">Manage your credits and subscription</p>
+                </div>
 
-                        {!isFreeTier && (
-                            <div className="flex gap-2 pt-2">
-                                {isCancelled ? (
-                                    <Button
-                                        onClick={handleReactivate}
-                                        disabled={isCancelling}
-                                        className="flex-1"
-                                    >
-                                        <RotateCcw className="h-4 w-4 mr-2" />
-                                        {isCancelling ? 'Reactivating...' : 'Reactivate Subscription'}
-                                    </Button>
-                                ) : (
-                                    <>
-                                        <Button
-                                            onClick={handleManageSubscription}
-                                            disabled={isManaging}
-                                            variant="outline"
-                                            className="flex-1"
-                                        >
-                                            {isManaging ? 'Loading...' : 'Manage Subscription'}
-                                        </Button>
-                                        <Button
-                                            onClick={() => setShowCancelDialog(true)}
-                                            variant="outline"
-                                            className="flex-1 text-destructive hover:text-destructive"
-                                        >
-                                            Cancel Plan
-                                        </Button>
-                                    </>
-                                )}
-                            </div>
+                {/* Plan Badge with Renewal Info - Right aligned */}
+                {!isFreeTier && planName && (
+                    <div className="flex items-center gap-2 text-right">
+                        {planIcon && (
+                            <>
+                                <div className="rounded-full py-0.5 flex items-center justify-center">
+                                    <img src={planIcon} alt={planName} className="h-6 w-auto" />
+                                </div>
+                            </>
                         )}
-                    </CardContent>
-                </Card>
-            )}
-            <div>
-                <CreditBalanceDisplay
-                    balance={subscriptionData?.credit_balance || 0}
-                    canPurchase={subscriptionData?.can_purchase_credits || false}
-                    onPurchaseClick={() => setShowCreditPurchaseModal(true)}
-                />
+                        {subscription?.current_period_end && (
+                            <span className="text-xs text-muted-foreground">
+                                Renews {formatDateFlexible(subscription.current_period_end)}
+                            </span>
+                        )}
+                    </div>
+                )}
             </div>
 
-            <CreditsHelpAlert />
+            {/* Credit Breakdown - 3 Boxes Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {/* Total Available Credits */}
+                <div className="relative overflow-hidden rounded-[18px] border border-border bg-card p-6">
+                    <div className="flex flex-col gap-3">
+                        <div className="flex items-center gap-2">
+                            <CreditCard className="h-4 w-4 text-muted-foreground" />
+                            <span className="text-sm text-muted-foreground">Total Available Credits</span>
+                        </div>
+                        <div>
+                            <div className="text-2xl leading-none font-medium mb-1">{formatCredits(totalCredits)}</div>
+                            <p className="text-xs text-muted-foreground">All credits</p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Monthly Credits */}
+                <div className="relative overflow-hidden rounded-[18px] border border-orange-500/20 bg-gradient-to-br from-orange-500/5 to-transparent p-6">
+                    <div className="flex flex-col gap-3">
+                        <div className="flex items-center gap-2">
+                            <Clock className="h-4 w-4 text-orange-500" />
+                            <span className="text-sm text-muted-foreground">Monthly Credits</span>
+                        </div>
+                        <div>
+                            <div className="text-2xl leading-none font-medium mb-1">{formatCredits(expiringCredits)}</div>
+                            <p className="text-xs text-muted-foreground">
+                                {daysUntilRefresh !== null 
+                                    ? `Renewal in ${daysUntilRefresh} ${daysUntilRefresh === 1 ? 'day' : 'days'}`
+                                    : 'No renewal scheduled'
+                                }
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Extra Credits */}
+                <div className="relative overflow-hidden rounded-[18px] border border-border bg-card p-6">
+                    <div className="flex flex-col gap-3">
+                        <div className="flex items-center gap-2">
+                            <Infinity className="h-4 w-4 text-muted-foreground" />
+                            <span className="text-sm text-muted-foreground">Extra Credits</span>
+                        </div>
+                        <div>
+                            <div className="text-2xl leading-none font-medium mb-1">{formatCredits(nonExpiringCredits)}</div>
+                            <p className="text-xs text-muted-foreground">Non-expiring</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            {/* Action Buttons - Clean Layout */}
+            <div className="flex items-center gap-3">
+                <Button
+                    onClick={handleManageSubscription}
+                    disabled={createPortalSessionMutation.isPending}
+                    className="h-10"
+                >
+                    {createPortalSessionMutation.isPending ? 'Loading...' : 'Manage Subscription'}
+                </Button>
+                {canPurchaseCredits && (
+                    <Button
+                        onClick={() => setShowCreditPurchaseModal(true)}
+                        variant="outline"
+                        className="h-10"
+                    >
+                        <ShoppingCart className="h-4 w-4 mr-2" />
+                        Get Additional Credits
+                    </Button>
+                )}
+                {!isFreeTier && planName && (
+                    <Button
+                        onClick={onOpenPlanModal}
+                        variant="outline"
+                        className="h-10"
+                    >
+                        Change Plan
+                    </Button>
+                )}
+            </div>
+
+            {/* Commitment or Cancellation Alerts */}
+            {commitmentInfo?.has_commitment && (
+                <Alert className="border-blue-500/20 bg-blue-500/5 rounded-[18px]">
+                    <Shield className="h-4 w-4 text-blue-500" />
+                    <AlertDescription>
+                        <strong className="text-sm">Annual Commitment</strong>
+                        <p className="text-sm text-muted-foreground mt-1">
+                            Active until {formatEndDate(commitmentInfo.commitment_end_date || '')}
+                        </p>
+                    </AlertDescription>
+                </Alert>
+            )}
+
+            {scheduledChangesData?.has_scheduled_change && scheduledChangesData.scheduled_change && (
+                <ScheduledDowngradeCard
+                    scheduledChange={scheduledChangesData.scheduled_change}
+                    onCancel={() => {
+                        refetchSubscription();
+                        refetchScheduledChanges();
+                    }}
+                />
+            )}
+
+            {isCancelled && (
+                <Alert variant="destructive" className="rounded-[18px]">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertDescription>
+                        Your subscription will be cancelled on {getEffectiveCancellationDate()}
+                        {!isCancelled && (
+                            <Button
+                                onClick={handleReactivate}
+                                variant="outline"
+                                size="sm"
+                                className="ml-4"
+                            >
+                                Reactivate
+                            </Button>
+                        )}
+                    </AlertDescription>
+                </Alert>
+            )}
+
+            {/* Help Link - Subtle */}
+            <div className="flex items-center justify-center pt-6 border-t border-border/50">
+                <Button
+                    variant="link"
+                    onClick={() => window.open('/credits-explained', '_blank')}
+                    className="text-muted-foreground hover:text-foreground h-auto p-0"
+                >
+                    <Lightbulb className="h-3.5 w-3.5 mr-2" />
+                    <span className="text-sm">Credits explained</span>
+                </Button>
+            </div>
+
+            {/* Cancel Plan Button - Subtle Placement */}
+            {!isFreeTier && !isCancelled && (
+                <div className="flex justify-center">
+                    <Button
+                        onClick={() => setShowCancelDialog(true)}
+                        variant="ghost"
+                        size="sm"
+                        className="text-muted-foreground hover:text-destructive h-auto p-2 text-xs"
+                    >
+                        Cancel Plan
+                    </Button>
+                </div>
+            )}
+
+            {isCancelled && (
+                <div className="flex justify-center">
+                    <Button
+                        onClick={handleReactivate}
+                        disabled={reactivateSubscriptionMutation.isPending}
+                        variant="outline"
+                        size="sm"
+                    >
+                        <RotateCcw className="h-3.5 w-3.5 mr-2" />
+                        {reactivateSubscriptionMutation.isPending ? 'Reactivating...' : 'Reactivate Subscription'}
+                    </Button>
+                </div>
+            )}
             <Dialog open={showCancelDialog} onOpenChange={setShowCancelDialog}>
                 <DialogContent className="max-w-md">
                     <DialogHeader>
@@ -816,14 +876,18 @@ function BillingTab({ returnUrl, onOpenPlanModal }: { returnUrl: string; onOpenP
                     <div className="space-y-4">
                         <p className="text-sm text-muted-foreground">
                             Are you sure you want to cancel your subscription? You'll continue to have access until{' '}
-                            {subscription?.current_period_end && formatDate(subscription.current_period_end)}.
+                            {subscription?.current_period_end && formatDateFlexible(subscription.current_period_end)}.
                         </p>
                         <div className="flex gap-2 justify-end">
                             <Button variant="outline" onClick={() => setShowCancelDialog(false)}>
                                 Keep Subscription
                             </Button>
-                            <Button variant="destructive" onClick={handleCancel} disabled={isCancelling}>
-                                {isCancelling ? 'Cancelling...' : 'Cancel Plan'}
+                            <Button 
+                                variant="destructive" 
+                                onClick={handleCancel} 
+                                disabled={cancelSubscriptionMutation.isPending}
+                            >
+                                {cancelSubscriptionMutation.isPending ? 'Cancelling...' : 'Cancel Plan'}
                             </Button>
                         </div>
                     </div>
@@ -832,10 +896,11 @@ function BillingTab({ returnUrl, onOpenPlanModal }: { returnUrl: string; onOpenP
             <CreditPurchaseModal
                 open={showCreditPurchaseModal}
                 onOpenChange={setShowCreditPurchaseModal}
-                currentBalance={subscriptionData?.credit_balance || 0}
-                canPurchase={subscriptionData?.can_purchase_credits || false}
+                currentBalance={totalCredits / 100}
+                canPurchase={canPurchaseCredits}
                 onPurchaseComplete={() => {
-                    fetchSubscriptionData();
+                    refetchSubscription();
+                    refetchBalance();
                 }}
             />
         </div>
@@ -874,6 +939,42 @@ function EnvManagerTab() {
     return (
         <div className="p-6">
             <LocalEnvManager />
+        </div>
+    );
+}
+
+function KnowledgeBaseTab() {
+    useEffect(() => {
+        window.open('/knowledge', '_blank');
+    }, []);
+    
+    return (
+        <div className="p-6 space-y-4">
+            <div className="text-center py-8">
+                <FileText className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                <h3 className="text-lg font-semibold mb-2">Opening Knowledge Base</h3>
+                <p className="text-sm text-muted-foreground">
+                    Redirecting to Knowledge Base page...
+                </p>
+            </div>
+        </div>
+    );
+}
+
+function IntegrationsTab() {
+    useEffect(() => {
+        window.open('/settings/credentials', '_blank');
+    }, []);
+    
+    return (
+        <div className="p-6 space-y-4">
+            <div className="text-center py-8">
+                <Plug className="h-12 w-12 mx-auto mb-4 text-muted-foreground" />
+                <h3 className="text-lg font-semibold mb-2">Opening Integrations</h3>
+                <p className="text-sm text-muted-foreground">
+                    Redirecting to Integrations page...
+                </p>
+            </div>
         </div>
     );
 }

@@ -2,7 +2,7 @@ import React from 'react';
 import { SiteHeader } from '@/components/thread/thread-site-header';
 import { FileViewerModal } from '@/components/thread/file-viewer-modal';
 import { ToolCallSidePanel } from '@/components/thread/tool-call-side-panel';
-import { Project } from '@/lib/api';
+import { Project } from '@/lib/api/projects';
 import { ApiMessageType } from '@/components/thread/types';
 import { ToolCallInput } from '@/components/thread/tool-call-side-panel';
 import { useIsMobile } from '@/hooks/utils';
@@ -38,6 +38,7 @@ interface ThreadLayoutProps {
   agentName?: string;
   disableInitialAnimation?: boolean;
   compact?: boolean;
+  variant?: 'default' | 'shared';
 }
 
 export function ThreadLayout({
@@ -70,10 +71,11 @@ export function ThreadLayout({
   initialLoadCompleted,
   agentName,
   disableInitialAnimation = false,
-  compact = false
+  compact = false,
+  variant = 'default'
 }: ThreadLayoutProps) {
   const isActuallyMobile = useIsMobile();
-  
+
   // Compact mode for embedded use
   if (compact) {
     return (
@@ -154,6 +156,7 @@ export function ThreadLayout({
           onProjectRenamed={onProjectRenamed}
           isMobileView={isMobile}
           debugMode={debugMode}
+          variant={variant}
         />
 
         {children}

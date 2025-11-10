@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { 
   createThread, 
   addUserMessage 
-} from '@/lib/api';
+} from '@/lib/api/threads';
 import { toast } from 'sonner';
 import { handleApiError } from '@/lib/error-handler';
 import { deleteThread } from './utils';
@@ -51,8 +51,10 @@ export const useDeleteThread = () => {
     mutationFn: async ({ threadId, sandboxId }: DeleteThreadVariables) => {
       return await deleteThread(threadId, sandboxId);
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: threadKeys.lists() });
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: threadKeys.lists() });
+      await queryClient.invalidateQueries({ queryKey: threadKeys.limit() });
+      await queryClient.refetchQueries({ queryKey: threadKeys.limit() });
     },
   });
 };
@@ -88,8 +90,10 @@ export const useDeleteMultipleThreads = () => {
         failed: results.filter(r => !r.success).map(r => r.threadId),
       };
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: threadKeys.lists() });
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: threadKeys.lists() });
+      await queryClient.invalidateQueries({ queryKey: threadKeys.limit() });
+      await queryClient.refetchQueries({ queryKey: threadKeys.limit() });
     },
   });
 };

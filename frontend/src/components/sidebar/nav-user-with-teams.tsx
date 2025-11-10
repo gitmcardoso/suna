@@ -27,6 +27,7 @@ import {
   Users,
   BarChart3,
   FileText,
+  TrendingDown,
 } from 'lucide-react';
 import { useAccounts } from '@/hooks/account';
 import { useSubscription } from '@/hooks/billing';
@@ -84,18 +85,18 @@ export function NavUserWithTeams({
   const router = useRouter();
   const { isMobile } = useSidebar();
   const { data: accounts } = useAccounts();
-  const { data: subscriptionData } = useSubscription(true);
+  const { data: subscriptionData } = useSubscription({ enabled: true });
   const [showNewTeamDialog, setShowNewTeamDialog] = React.useState(false);
   const [showSettingsModal, setShowSettingsModal] = React.useState(false);
   const [showPlanModal, setShowPlanModal] = React.useState(false);
-  const [settingsTab, setSettingsTab] = React.useState<'general' | 'billing' | 'env-manager'>('general');
+  const [settingsTab, setSettingsTab] = React.useState<'general' | 'billing' | 'usage' | 'env-manager'>('general');
   const { theme, setTheme } = useTheme();
 
   // Check if user is on free tier
-  const isFreeTier = subscriptionData?.tier_key === 'free' || 
-                     subscriptionData?.tier?.name === 'free' || 
-                     subscriptionData?.plan_name === 'free' ||
-                     !subscriptionData?.tier_key;
+  const isFreeTier = subscriptionData?.tier_key === 'free' ||
+    subscriptionData?.tier?.name === 'free' ||
+    subscriptionData?.plan_name === 'free' ||
+    !subscriptionData?.tier_key;
 
   // Prepare personal account and team accounts
   const personalAccount = React.useMemo(
@@ -212,7 +213,7 @@ export function NavUserWithTeams({
                 <div className="flex flex-col justify-between flex-1 min-w-0 h-10 group-data-[collapsible=icon]:hidden">
                   <span className="truncate font-medium text-sm leading-tight">{user.name}</span>
                   {user.planName ? (
-                    <TierBadge planName={user.planName} size="xxs" variant="default" />
+                    <TierBadge planName={user.planName} size="xs" variant="default" />
                   ) : (
                     <span className="truncate text-xs text-muted-foreground leading-tight">{user.email}</span>
                   )}
@@ -336,6 +337,16 @@ export function NavUserWithTeams({
                   <CreditCard className="h-4 w-4" />
                   <span>Billing</span>
                 </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    setSettingsTab('usage');
+                    setShowSettingsModal(true);
+                  }}
+                  className="gap-2 p-2"
+                >
+                  <TrendingDown className="h-4 w-4" />
+                  <span>Usage</span>
+                </DropdownMenuItem>
                 <DropdownMenuItem asChild>
                   <Link href="/settings/credentials" className="gap-2 p-2">
                     <Plug className="h-4 w-4" />
@@ -410,15 +421,15 @@ export function NavUserWithTeams({
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
-          
+
           {/* Upgrade Button - Only for Free Tier */}
           {isFreeTier && (
-            <div className="absolute bottom-full left-0 right-0 mb-2 px-0 group-data-[collapsible=icon]:hidden">
+            <div className="absolute bottom-full left-0 right-0 mb-2 px-0 group-data-[collapsible=icon]:hidden z-50">
               <Button
                 onClick={() => setShowPlanModal(true)}
                 variant="default"
                 size="lg"
-                className="w-full"
+                className="w-full relative z-50"
               >
                 Upgrade
               </Button>
